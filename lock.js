@@ -8,7 +8,7 @@
 const redis = require("./redis-client");
 
 const LOCK_PREFIX = "lock:";
-const LOCK_TTL_SEC = 15;
+const LOCK_TTL_SEC = 2;
 
 async function acquireLock(key) {
   const lockKey = LOCK_PREFIX + key;

@@ -139,7 +139,6 @@ app.patch("/products/:id", async (req, res) => {
 
     // Event-driven invalidation: emit event to delete cache
     eventDriven.emitInvalidation();
-
     // Version-key invalidation: bump the version counter
     await versionKey.bumpVersion(ALL_KEY);
 

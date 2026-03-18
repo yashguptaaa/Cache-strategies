@@ -21,14 +21,54 @@ const LOG = {
 };
 
 async function get(fetchFn, key, ttlSec) {
-  const client = redis.getClient();
-  if (!client) return fetchFn();
+const client = redis.getClient();
+if (!client) return fetchFn();
 
-  const cached = await client.get(key);
-  if (cached) {
+const cached = await client.get(key);
+if (cached) {
+  LOG.CACHE_HIT();
+  try {
+    const parsed = JSON.parse(cached);
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.data))
+      return parsed.data;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+LOG.CACHE_MISS();
+
+const lockKey = `lock:rt:${key}`;
+
+const lock = await client.set(lockKey, "1", "NX", "EX", LOCK_TTL_SEC);
+
+if (lock) {
+  LOG.LOCK_ACQUIRED();
+  try {
+    LOG.DB_QUERY_EXECUTED();
+    const data = await fetchFn();
+    const result = data || [];
+
+    await client.setex(key, ttlSec, JSON.stringify(result));
+    LOG.CACHE_FILLED();
+
+    return result;
+  } finally {
+    await client.del(lockKey);
+  }
+}
+
+LOG.WAITING_FOR_FILL();
+
+const start = Date.now();
+while (Date.now() - start < MAX_WAIT_MS) {
+  await sleep(POLL_INTERVAL_MS);
+  const retry = await client.get(key);
+  if (retry) {
     LOG.CACHE_HIT();
     try {
-      const parsed = JSON.parse(cached);
+      const parsed = JSON.parse(retry);
       if (parsed && typeof parsed === "object" && Array.isArray(parsed.data))
         return parsed.data;
       return parsed;
@@ -36,50 +76,10 @@ async function get(fetchFn, key, ttlSec) {
       return null;
     }
   }
+}
 
-  LOG.CACHE_MISS();
-
-  const lockKey = `lock:rt:${key}`;
-
-  const lock = await client.set(lockKey, "1", "NX", "EX", LOCK_TTL_SEC);
-
-  if (lock) {
-    LOG.LOCK_ACQUIRED();
-    try {
-      LOG.DB_QUERY_EXECUTED();
-      const data = await fetchFn();
-      const result = data || [];
-
-      await client.setex(key, ttlSec, JSON.stringify(result));
-      LOG.CACHE_FILLED();
-
-      return result;
-    } finally {
-      await client.del(lockKey);
-    }
-  }
-
-  LOG.WAITING_FOR_FILL();
-
-  const start = Date.now();
-  while (Date.now() - start < MAX_WAIT_MS) {
-    await sleep(POLL_INTERVAL_MS);
-    const retry = await client.get(key);
-    if (retry) {
-      LOG.CACHE_HIT();
-      try {
-        const parsed = JSON.parse(retry);
-        if (parsed && typeof parsed === "object" && Array.isArray(parsed.data))
-          return parsed.data;
-        return parsed;
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  LOG.FALLBACK_FETCH();
-  return fetchFn();
+LOG.FALLBACK_FETCH();
+return fetchFn();
 }
 
 async function getAllProducts(cache, db, key, ttlSec) {
