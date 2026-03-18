@@ -89,12 +89,45 @@ async function setStale(key) {
   return true;
 }
 
+async function del(key) {
+  const client = redis.getClient();
+  if (!client) return false;
+  const result = await client.del(key);
+  return result > 0;
+}
+
+async function getVersioned(key) {
+  const client = redis.getClient();
+  if (!client) return null;
+  const raw = await client.get(key);
+  if (raw == null) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.version === "number" && Array.isArray(parsed.data)) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function setVersioned(key, data, version, ttlSec) {
+  const client = redis.getClient();
+  if (!client) return;
+  const value = JSON.stringify({ data, version });
+  await client.setex(key, ttlSec, value);
+}
+
 module.exports = {
   cacheKey,
   ALL_PRODUCTS_KEY,
   get,
   set,
+  del,
   getWithExpiry,
   setWithExpiry,
   setStale,
+  getVersioned,
+  setVersioned,
 };

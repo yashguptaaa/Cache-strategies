@@ -11,6 +11,8 @@ const tieredCache = require("./tiered-cache");
 const ttlJitter = require("./ttl-jitter");
 const cacheWarming = require("./cache-warming");
 const writeBehind = require("./write-behind");
+const eventDriven = require("./event-driven");
+const versionKey = require("./version-key");
 const writeBehindWorker = require("./write-behind-worker");
 
 const app = express();
@@ -102,7 +104,7 @@ app.get("/products", async (req, res) => {
   try {
     const products = await getAllProducts(strategy);
     res.set("X-Response-Time-Ms", String(Date.now() - start));
-    res.json(products);
+    res.json(products.map(({ id, ...rest }) => rest));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
@@ -134,6 +136,13 @@ app.patch("/products/:id", async (req, res) => {
         "[PATCH /products/:id] Cache marked stale; next GET (stale-revalidate) will serve old data and revalidate.",
       );
     }
+
+    // Event-driven invalidation: emit event to delete cache
+    eventDriven.emitInvalidation();
+
+    // Version-key invalidation: bump the version counter
+    await versionKey.bumpVersion(ALL_KEY);
+
     res.json(updated);
   } catch (err) {
     console.error(err);
@@ -142,13 +151,30 @@ app.patch("/products/:id", async (req, res) => {
 });
 
 app.post("/products/write-behind", async (req, res) => {
-  const { name, price, category } = req.body || {};
-  if (!name || price === undefined || !category) {
-    return res.status(400).json({
-      error: "Provide name, price, and category",
-    });
-  }
   try {
+    const body = req.body;
+
+    // Bulk mode: accept an array of products
+    if (Array.isArray(body)) {
+      if (body.length === 0) {
+        return res.status(400).json({ error: "Provide a non-empty array of products" });
+      }
+      const results = await writeBehind.createProductsBulk(body);
+      return res.json({
+        status: "queued",
+        message: `${results.length} products cached in Redis & queued for DB insert via BullMQ.`,
+        count: results.length,
+        products: results,
+      });
+    }
+
+    // Single product mode (existing behavior)
+    const { name, price, category } = body || {};
+    if (!name || price === undefined || !category) {
+      return res.status(400).json({
+        error: "Provide name, price, and category",
+      });
+    }
     const result = await writeBehind.createProduct(
       { name, price, category },
       ALL_KEY,
@@ -169,6 +195,31 @@ app.get("/demo/write-behind-pending", async (req, res) => {
   try {
     const pending = await writeBehind.getPendingProducts();
     res.json({ count: pending.length, products: pending });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/cache-invalidation", async (req, res) => {
+  const strategy = req.query.strategy;
+  const start = Date.now();
+  try {
+    let products;
+    switch (strategy) {
+      case "event-driven":
+        products = await eventDriven.getAllProducts(cache, db, ALL_KEY, CACHE_TTL_SEC);
+        break;
+      case "version-key":
+        products = await versionKey.getAllProducts(cache, db, ALL_KEY, CACHE_TTL_SEC);
+        break;
+      default:
+        return res.status(400).json({
+          error: "Invalid strategy. Use ?strategy=event-driven or ?strategy=version-key",
+        });
+    }
+    res.set("X-Response-Time-Ms", String(Date.now() - start));
+    res.json(products.map(({ id, ...rest }) => rest));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
@@ -342,6 +393,9 @@ async function main() {
   await db.init();
   const redisClient = redis.createClient();
 
+  // Set up event-driven invalidation listener
+  eventDriven.setupListeners(cache, ALL_KEY);
+
   writeBehindWorker.startWorker({
     host: redisClient.options.host || "localhost",
     port: redisClient.options.port || 6379,
@@ -352,6 +406,9 @@ async function main() {
     console.log(`Cache Stampede Demo — http://localhost:${PORT}`);
     console.log(
       "GET /products?strategy=stampede|lock|read-through|stale-revalidate|coalescing|tiered|jitter|warming",
+    );
+    console.log(
+      "GET /cache-invalidation?strategy=event-driven|version-key",
     );
     console.log(
       "POST /products/write-behind — Write-Behind (BullMQ)",

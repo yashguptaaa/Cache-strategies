@@ -34,49 +34,39 @@ async function run() {
   console.log(`\n🚀 Write-Behind Bulk Insert — ${COUNT} products\n`);
   console.log(`   Target: POST ${BASE_URL}/products/write-behind\n`);
 
-  const start = Date.now();
-  const results = [];
-
+  // Collect all products into an array
+  console.log(`   Generating ${COUNT} products...`);
+  const products = [];
   for (let i = 1; i <= COUNT; i++) {
-    const product = randomProduct(i);
-    const t0 = Date.now();
-
-    try {
-      const res = await fetch(`${BASE_URL}/products/write-behind`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(product),
-      });
-
-      const data = await res.json();
-      const ms = Date.now() - t0;
-
-      results.push({ i, ms, status: res.status, name: product.name });
-
-      if (i % 10 === 0 || i === 1) {
-        console.log(`   [${i}/${COUNT}] ${product.name} → ${ms}ms (${data.status})`);
-      }
-    } catch (err) {
-      results.push({ i, ms: Date.now() - t0, status: "error", name: product.name });
-      console.error(`   [${i}/${COUNT}] FAILED: ${err.message}`);
-    }
+    products.push(randomProduct(i));
   }
+  console.log(`   ✅ ${products.length} products generated\n`);
 
-  const totalMs = Date.now() - start;
-  const times = results.map((r) => r.ms);
-  const avg = Math.round(times.reduce((a, b) => a + b, 0) / times.length);
-  const min = Math.min(...times);
-  const max = Math.max(...times);
-  const successful = results.filter((r) => r.status === 200).length;
+  // Send all products in ONE bulk request
+  console.log(`   Sending bulk request (${products.length} products as array)...`);
+  const start = Date.now();
 
-  console.log(`\n✅ Done!\n`);
-  console.log(`   Total:      ${totalMs}ms`);
-  console.log(`   Successful: ${successful}/${COUNT}`);
-  console.log(`   Avg:        ${avg}ms per request`);
-  console.log(`   Min:        ${min}ms`);
-  console.log(`   Max:        ${max}ms`);
-  console.log(`\n💡 Check server logs — all ${COUNT} products were cached instantly.`);
-  console.log(`   The BullMQ worker is inserting them into PostgreSQL in the background.\n`);
+  try {
+    const res = await fetch(`${BASE_URL}/products/write-behind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(products),
+    });
+
+    const data = await res.json();
+    const totalMs = Date.now() - start;
+
+    console.log(`\n✅ Done!\n`);
+    console.log(`   Status:     ${data.status}`);
+    console.log(`   Count:      ${data.count} products`);
+    console.log(`   Total:      ${totalMs}ms`);
+    console.log(`   Message:    ${data.message}`);
+    console.log(`\n💡 All ${COUNT} products were pushed to Redis & queued for DB in one batch.`);
+    console.log(`   The BullMQ worker is inserting them into PostgreSQL in the background.\n`);
+  } catch (err) {
+    const totalMs = Date.now() - start;
+    console.error(`\n❌ FAILED after ${totalMs}ms: ${err.message}\n`);
+  }
 }
 
 run();

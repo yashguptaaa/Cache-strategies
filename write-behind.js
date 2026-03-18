@@ -1,7 +1,7 @@
 const redis = require("./redis-client");
 const { getQueue } = require("./queue");
 
-const PENDING_KEY = "products:write-behind";
+const PENDING_KEY = "product:all";
 
 const LOG = {
   CACHE_STORED: (product) =>
@@ -9,6 +9,17 @@ const LOG = {
   QUEUED: (product, jobId) =>
     console.log(`[WRITE_BEHIND] QUEUED — "${product.name}" enqueued for DB insert (jobId: ${jobId})`),
 };
+
+async function getExisting(client) {
+  const raw = await client.get(PENDING_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray(parsed.data)) return parsed.data;
+    return [];
+  } catch { return []; }
+}
 
 async function createProduct(data, allKey, ttlSec) {
   const client = redis.getClient();
@@ -23,8 +34,10 @@ async function createProduct(data, allKey, ttlSec) {
     category,
   };
 
-  // 1️⃣ RPUSH to Redis list — atomic, handles 100 concurrent writes safely
-  await client.rpush(PENDING_KEY, JSON.stringify(product));
+  // 1️⃣ GET existing array, append, SET back
+  const existing = await getExisting(client);
+  existing.push(product);
+  await client.set(PENDING_KEY, JSON.stringify(existing));
   LOG.CACHE_STORED(product);
 
   // 2️⃣ Enqueue DB insert via BullMQ (async flush to PostgreSQL)
@@ -42,27 +55,53 @@ async function createProduct(data, allKey, ttlSec) {
 async function getPendingProducts() {
   const client = redis.getClient();
   if (!client) return [];
-
-  const items = await client.lrange(PENDING_KEY, 0, -1);
-  return items.map((item) => {
-    try { return JSON.parse(item); } catch { return null; }
-  }).filter(Boolean);
+  return getExisting(client);
 }
 
 async function removePending(productTempId) {
   const client = redis.getClient();
   if (!client) return;
 
-  const items = await client.lrange(PENDING_KEY, 0, -1);
-  for (const item of items) {
-    try {
-      const parsed = JSON.parse(item);
-      if (parsed.id === productTempId) {
-        await client.lrem(PENDING_KEY, 1, item);
-        return;
-      }
-    } catch {}
-  }
+  const existing = await getExisting(client);
+  const filtered = existing.filter((p) => p.id !== productTempId);
+  await client.set(PENDING_KEY, JSON.stringify(filtered));
 }
 
-module.exports = { createProduct, getPendingProducts, removePending, PENDING_KEY };
+/**
+ * Bulk write-behind: accepts an array of products,
+ * pushes ALL to Redis in one go, then queues ALL to BullMQ.
+ */
+async function createProductsBulk(items) {
+  const client = redis.getClient();
+  if (!client) throw new Error("Redis not connected");
+
+  // 1️⃣ Prepare all products & push ALL to Redis in one SET
+  const products = items.map((data) => ({
+    id: `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    name: data.name,
+    price: parseFloat(data.price),
+    category: data.category,
+  }));
+
+  const existing = await getExisting(client);
+  const merged = [...existing, ...products];
+  await client.set(PENDING_KEY, JSON.stringify(merged));
+  console.log(`[WRITE_BEHIND] BULK_CACHED — ${products.length} products pushed to Redis`);
+
+  // 2️⃣ Queue ALL to BullMQ in batch
+  const queue = getQueue();
+  const jobData = products.map((p) => ({
+    name: "insert-product",
+    data: { name: p.name, price: p.price, category: p.category, tempId: p.id },
+  }));
+  const jobs = await queue.addBulk(jobData);
+  console.log(`[WRITE_BEHIND] BULK_QUEUED — ${jobs.length} jobs enqueued for DB insert`);
+
+  return products.map((p, i) => ({
+    ...p,
+    _writeBehind: true,
+    _jobId: jobs[i].id,
+  }));
+}
+
+module.exports = { createProduct, createProductsBulk, getPendingProducts, removePending, PENDING_KEY };
